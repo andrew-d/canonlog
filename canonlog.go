@@ -1,0 +1,187 @@
+// Package canonlog provides a minimal library for emitting canonical log lines.
+//
+// A canonical log line is a single structured log line emitted at the end of
+// each request that aggregates all important information about that request.
+// This pattern is useful for both human debugging and analytics.
+//
+// Basic usage:
+//
+//	// Register attributes at package level
+//	var (
+//		AttrUserID = canonlog.Register[string]("user_id")
+//		AttrStatus = canonlog.Register[int]("status")
+//	)
+//
+//	// In your handler
+//	func handler(w http.ResponseWriter, r *http.Request) {
+//		ctx := canonlog.New(r.Context())
+//		canonlog.Set(ctx, AttrUserID, "usr_123")
+//		canonlog.Set(ctx, AttrStatus, 200)
+//
+//		// At the end, emit the log line
+//		slog.LogAttrs(ctx, slog.LevelInfo, "canonical-log-line", canonlog.Attrs(ctx)...)
+//	}
+package canonlog
+
+// TODO:
+// - Make registry non-global, but have a DefaultRegistry and package-global functions that use it.
+// - Allow configuring the type-to-slog.Value conversion per attribute.
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+)
+
+type registry struct {
+	mu   sync.Mutex
+	keys map[string]bool
+}
+
+// globalRegistry tracks all registered attribute keys to prevent duplicates.
+var globalRegistry registry
+
+// Attr is a type-safe handle for a registered attribute.
+// It is created by [Register] and used with [Set] to store values.
+type Attr[T any] struct {
+	key   string
+	merge func(old, new T) T
+}
+
+// Key returns the attribute's key name.
+func (a Attr[T]) Key() string {
+	return a.key
+}
+
+// Option configures an Attr during registration.
+type Option[T any] func(*Attr[T])
+
+// WithMerge sets a merge function that is called when the same attribute
+// is set multiple times. The function receives the existing value and the
+// new value, and returns the value to store.
+//
+// If no merge function is set, the default behavior is to overwrite
+// the existing value with the new value.
+func WithMerge[T any](fn func(old, new T) T) Option[T] {
+	return func(a *Attr[T]) {
+		a.merge = fn
+	}
+}
+
+// Register creates a new attribute with the given key.
+// It panics if an attribute with the same key has already been registered.
+//
+// Register is typically called at package initialization time:
+//
+//	var AttrUserID = canonlog.Register[string]("user_id")
+func Register[T any](key string, opts ...Option[T]) Attr[T] {
+	globalRegistry.mu.Lock()
+	defer globalRegistry.mu.Unlock()
+
+	if globalRegistry.keys == nil {
+		globalRegistry.keys = make(map[string]bool)
+	}
+	if globalRegistry.keys[key] {
+		panic("canonlog: duplicate attribute key: " + key)
+	}
+	globalRegistry.keys[key] = true
+
+	attr := Attr[T]{key: key}
+	for _, opt := range opts {
+		opt(&attr)
+	}
+	return attr
+}
+
+// Line accumulates attributes for a single canonical log line.
+// It is safe for concurrent use.
+type Line struct {
+	mu     sync.Mutex
+	values map[string]any // raw values
+	order  []string       // maintains insertion order for consistent output
+}
+
+// ctxKey is the context key for storing the Line.
+type ctxKey struct{}
+
+// New creates a new [Line] and returns a context containing it.
+//
+// Use [Set] to add attributes to the line, and [Attrs] to retrieve them.
+func New(ctx context.Context) context.Context {
+	line := &Line{
+		values: make(map[string]any),
+	}
+	return context.WithValue(ctx, ctxKey{}, line)
+}
+
+// FromContext retrieves a [Line] from the provided [context.Context], or nil
+// if none exists.
+func FromContext(ctx context.Context) *Line {
+	if l, ok := ctx.Value(ctxKey{}).(*Line); ok {
+		return l
+	}
+	return nil
+}
+
+// toSlogValue converts a value to an slog.Value, with special handling for
+// certain datatypes.
+func toSlogValue(v any) slog.Value {
+	return slog.AnyValue(v)
+}
+
+// Set stores a value for the given attribute in the [Line] attached to ctx.
+// If the context does not have a Line ([New] was not called), Set silently
+// does nothing.
+//
+// If the attribute was already set and has a merge function, the merge
+// function is called to combine the old and new values. Otherwise, the
+// new value overwrites the old value.
+func Set[T any](ctx context.Context, attr Attr[T], value T) {
+	l := FromContext(ctx)
+	if l == nil {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	key := attr.key
+	if existing, exists := l.values[key]; exists && attr.merge != nil {
+		if oldVal, ok := existing.(T); ok {
+			value = attr.merge(oldVal, value)
+		}
+	}
+
+	// Track insertion order for new keys
+	if _, exists := l.values[key]; !exists {
+		l.order = append(l.order, key)
+	}
+
+	l.values[key] = value
+}
+
+// Attrs returns all set attributes as [slog.Attr] values.
+//
+// Attributes are returned in the order they were first set. If the context
+// does not have a [Line], nil is returned.
+func Attrs(ctx context.Context) []slog.Attr {
+	l := FromContext(ctx)
+	if l == nil {
+		return nil
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if len(l.values) == 0 {
+		return nil
+	}
+
+	result := make([]slog.Attr, 0, len(l.order))
+	for _, key := range l.order {
+		if value, exists := l.values[key]; exists {
+			result = append(result, slog.Attr{Key: key, Value: toSlogValue(value)})
+		}
+	}
+	return result
+}
