@@ -7,26 +7,36 @@ import (
 	"testing"
 )
 
-// resetRegistry clears the global registry for testing.
-func resetRegistry() {
-	globalRegistry.mu.Lock()
-	defer globalRegistry.mu.Unlock()
-	globalRegistry.keys = nil
+// testRegistry returns a new registry for use in a single test.
+func testRegistry(tb testing.TB) *Registry {
+	reg := NewRegistry()
+	tb.Cleanup(func() {
+		if !tb.Failed() {
+			return
+		}
+
+		reg.mu.Lock()
+		defer reg.mu.Unlock()
+		for key := range reg.keys {
+			tb.Logf("registered key: %q", key)
+		}
+	})
+	return reg
 }
 
 func TestRegister(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attr := Register[string]("test_key")
+	attr := RegisterWith[string](r, "test_key")
 	if attr.Key() != "test_key" {
 		t.Errorf("Key() = %q, want %q", attr.Key(), "test_key")
 	}
 }
 
 func TestRegister_PanicOnDuplicate(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	Register[string]("duplicate_key")
+	RegisterWith[string](r, "duplicate_key")
 
 	defer func() {
 		if r := recover(); r == nil {
@@ -34,15 +44,15 @@ func TestRegister_PanicOnDuplicate(t *testing.T) {
 		}
 	}()
 
-	Register[int]("duplicate_key") // should panic
+	RegisterWith[int](r, "duplicate_key") // should panic
 }
 
 func TestSetAndAttrs(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attrUserID := Register[string]("user_id")
-	attrStatus := Register[int]("status")
-	attrSuccess := Register[bool]("success")
+	attrUserID := RegisterWith[string](r, "user_id")
+	attrStatus := RegisterWith[int](r, "status")
+	attrSuccess := RegisterWith[bool](r, "success")
 
 	ctx := New(context.Background())
 
@@ -78,9 +88,9 @@ func TestSetAndAttrs(t *testing.T) {
 }
 
 func TestOverwrite(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attrCount := Register[int]("count")
+	attrCount := RegisterWith[int](r, "count")
 
 	ctx := New(context.Background())
 	Set(ctx, attrCount, 1)
@@ -99,9 +109,9 @@ func TestOverwrite(t *testing.T) {
 }
 
 func TestMergeFunction(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attrSum := Register[int]("sum", WithMerge(func(old, new int) int {
+	attrSum := RegisterWith[int](r, "sum", WithMerge(func(old, new int) int {
 		return old + new
 	}))
 
@@ -122,9 +132,9 @@ func TestMergeFunction(t *testing.T) {
 }
 
 func TestSetWithoutLine(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attr := Register[string]("orphan")
+	attr := RegisterWith[string](r, "orphan")
 
 	// Set on context without Line should not panic
 	ctx := context.Background()
@@ -137,8 +147,6 @@ func TestSetWithoutLine(t *testing.T) {
 }
 
 func TestAttrsEmpty(t *testing.T) {
-	resetRegistry()
-
 	ctx := New(context.Background())
 	attrs := Attrs(ctx)
 
@@ -148,9 +156,9 @@ func TestAttrsEmpty(t *testing.T) {
 }
 
 func TestConcurrentSet(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attrCounter := Register[int]("counter", WithMerge(func(old, new int) int {
+	attrCounter := RegisterWith[int](r, "counter", WithMerge(func(old, new int) int {
 		return old + new
 	}))
 
@@ -181,8 +189,6 @@ func TestConcurrentSet(t *testing.T) {
 }
 
 func TestFromContext(t *testing.T) {
-	resetRegistry()
-
 	// No line in context
 	ctx := context.Background()
 	if FromContext(ctx) != nil {
@@ -197,12 +203,12 @@ func TestFromContext(t *testing.T) {
 }
 
 func TestDifferentTypes(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attrString := Register[string]("string_val")
-	attrInt := Register[int]("int_val")
-	attrFloat := Register[float64]("float_val")
-	attrBool := Register[bool]("bool_val")
+	attrString := RegisterWith[string](r, "string_val")
+	attrInt := RegisterWith[int](r, "int_val")
+	attrFloat := RegisterWith[float64](r, "float_val")
+	attrBool := RegisterWith[bool](r, "bool_val")
 
 	ctx := New(context.Background())
 
@@ -232,9 +238,9 @@ func TestDifferentTypes(t *testing.T) {
 }
 
 func TestSlogAttrCompatibility(t *testing.T) {
-	resetRegistry()
+	r := testRegistry(t)
 
-	attrUser := Register[string]("user")
+	attrUser := RegisterWith[string](r, "user")
 	ctx := New(context.Background())
 	Set(ctx, attrUser, "test_user")
 

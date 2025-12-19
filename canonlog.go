@@ -24,7 +24,6 @@
 package canonlog
 
 // TODO:
-// - Make registry non-global, but have a DefaultRegistry and package-global functions that use it.
 // - Allow configuring the type-to-slog.Value conversion per attribute.
 
 import (
@@ -33,13 +32,24 @@ import (
 	"sync"
 )
 
-type registry struct {
+// Registry tracks registered attribute keys to prevent duplicates.
+// Use [NewRegistry] to create a new instance, or use [DefaultRegistry]
+// for the default global registry.
+type Registry struct {
 	mu   sync.Mutex
 	keys map[string]bool
 }
 
-// globalRegistry tracks all registered attribute keys to prevent duplicates.
-var globalRegistry registry
+// NewRegistry creates a new [Registry].
+func NewRegistry() *Registry {
+	return &Registry{
+		keys: make(map[string]bool),
+	}
+}
+
+// DefaultRegistry is the default registry used by package-level functions
+// like [Register].
+var DefaultRegistry = NewRegistry()
 
 // Attr is a type-safe handle for a registered attribute.
 // It is created by [Register] and used with [Set] to store values.
@@ -68,29 +78,38 @@ func WithMerge[T any](fn func(old, new T) T) Option[T] {
 	}
 }
 
-// Register creates a new attribute with the given key.
-// It panics if an attribute with the same key has already been registered.
+// RegisterWith creates a new attribute with the given key in the specified
+// registry. It panics if an attribute with the same key has already been
+// registered in that registry.
 //
-// Register is typically called at package initialization time:
-//
-//	var AttrUserID = canonlog.Register[string]("user_id")
-func Register[T any](key string, opts ...Option[T]) Attr[T] {
-	globalRegistry.mu.Lock()
-	defer globalRegistry.mu.Unlock()
+// Use [Register] for the common case of registering with [DefaultRegistry].
+func RegisterWith[T any](r *Registry, key string, opts ...Option[T]) Attr[T] {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	if globalRegistry.keys == nil {
-		globalRegistry.keys = make(map[string]bool)
+	if r.keys == nil {
+		r.keys = make(map[string]bool)
 	}
-	if globalRegistry.keys[key] {
+	if r.keys[key] {
 		panic("canonlog: duplicate attribute key: " + key)
 	}
-	globalRegistry.keys[key] = true
+	r.keys[key] = true
 
 	attr := Attr[T]{key: key}
 	for _, opt := range opts {
 		opt(&attr)
 	}
 	return attr
+}
+
+// Register creates a new attribute with the given key using [DefaultRegistry].
+// It panics if an attribute with the same key has already been registered.
+//
+// Register is typically called at package initialization time:
+//
+//	var AttrUserID = canonlog.Register[string]("user_id")
+func Register[T any](key string, opts ...Option[T]) Attr[T] {
+	return RegisterWith(DefaultRegistry, key, opts...)
 }
 
 // Line accumulates attributes for a single canonical log line.
