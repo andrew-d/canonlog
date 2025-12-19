@@ -2,6 +2,7 @@ package canonlog
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"testing"
@@ -248,4 +249,62 @@ func TestSlogAttrCompatibility(t *testing.T) {
 
 	// Assert that Attrs returns a slice of slog.Attr.
 	var _ []slog.Attr = attrs
+}
+
+func TestWithValue(t *testing.T) {
+	r := testRegistry(t)
+
+	// Custom converter that formats integers as hex strings
+	attrCode := RegisterWith[int](r, "code", WithValue(func(v int) slog.Value {
+		return slog.StringValue(fmt.Sprintf("0x%X", v))
+	}))
+
+	// Attribute without custom converter (uses default slog.AnyValue)
+	attrCount := RegisterWith[int](r, "count")
+
+	ctx := New(context.Background())
+	Set(ctx, attrCode, 5)
+	Set(ctx, attrCount, 42)
+
+	attrs := Attrs(ctx)
+	if len(attrs) != 2 {
+		t.Fatalf("Attrs() returned %d attributes, want 2", len(attrs))
+	}
+
+	// Check custom converter was applied
+	if got := attrs[0].Value.String(); got != "0x5" {
+		t.Errorf("code value = %q, want %q", got, "0x5")
+	}
+
+	// Check default conversion still works
+	if got := attrs[1].Value.Int64(); got != 42 {
+		t.Errorf("count value = %d, want %d", got, 42)
+	}
+}
+
+func TestWithValueAndMerge(t *testing.T) {
+	r := testRegistry(t)
+
+	// Attribute with both merge and custom value conversion
+	attrTotal := RegisterWith[int](r, "total",
+		WithMerge(func(old, new int) int { return old + new }),
+		WithValue(func(v int) slog.Value {
+			return slog.StringValue(fmt.Sprintf("$%d", v))
+		}),
+	)
+
+	ctx := New(context.Background())
+	Set(ctx, attrTotal, 1)
+	Set(ctx, attrTotal, 2)
+	Set(ctx, attrTotal, 3)
+
+	attrs := Attrs(ctx)
+	if len(attrs) != 1 {
+		t.Fatalf("Attrs() returned %d attributes, want 1", len(attrs))
+	}
+
+	// 1+2+3 = 6, formatted as "$6"
+	if got := attrs[0].Value.String(); got != "$6" {
+		t.Errorf("total value = %q, want %q", got, "$6")
+	}
 }

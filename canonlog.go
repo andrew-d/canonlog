@@ -23,9 +23,6 @@
 //	}
 package canonlog
 
-// TODO:
-// - Allow configuring the type-to-slog.Value conversion per attribute.
-
 import (
 	"context"
 	"log/slog"
@@ -54,8 +51,9 @@ var DefaultRegistry = NewRegistry()
 // Attr is a type-safe handle for a registered attribute.
 // It is created by [Register] and used with [Set] to store values.
 type Attr[T any] struct {
-	key   string
-	merge func(old, new T) T
+	key     string
+	merge   func(old, new T) T
+	toValue func(T) slog.Value
 }
 
 // Key returns the attribute's key name.
@@ -75,6 +73,23 @@ type Option[T any] func(*Attr[T])
 func WithMerge[T any](fn func(old, new T) T) Option[T] {
 	return func(a *Attr[T]) {
 		a.merge = fn
+	}
+}
+
+// WithValue sets a function to convert the attribute's value to an [slog.Value].
+//
+// If no conversion function is set, [slog.AnyValue] is used by default.
+//
+// Example:
+//
+//	var AttrDuration = canonlog.Register[time.Duration]("duration_sec",
+//		canonlog.WithValue(func(d time.Duration) slog.Value {
+//			return slog.Float64Value(d.Seconds())
+//		}),
+//	)
+func WithValue[T any](fn func(T) slog.Value) Option[T] {
+	return func(a *Attr[T]) {
+		a.toValue = fn
 	}
 }
 
@@ -112,12 +127,18 @@ func Register[T any](key string, opts ...Option[T]) Attr[T] {
 	return RegisterWith(DefaultRegistry, key, opts...)
 }
 
+// storedValue holds a raw value and an optional converter function.
+type storedValue struct {
+	raw     any
+	convert func(any) slog.Value
+}
+
 // Line accumulates attributes for a single canonical log line.
 // It is safe for concurrent use.
 type Line struct {
 	mu     sync.Mutex
-	values map[string]any // raw values
-	order  []string       // maintains insertion order for consistent output
+	values map[string]storedValue
+	order  []string // maintains insertion order for consistent output
 }
 
 // ctxKey is the context key for storing the Line.
@@ -128,7 +149,7 @@ type ctxKey struct{}
 // Use [Set] to add attributes to the line, and [Attrs] to retrieve them.
 func New(ctx context.Context) context.Context {
 	line := &Line{
-		values: make(map[string]any),
+		values: make(map[string]storedValue),
 	}
 	return context.WithValue(ctx, ctxKey{}, line)
 }
@@ -140,12 +161,6 @@ func FromContext(ctx context.Context) *Line {
 		return l
 	}
 	return nil
-}
-
-// toSlogValue converts a value to an slog.Value, with special handling for
-// certain datatypes.
-func toSlogValue(v any) slog.Value {
-	return slog.AnyValue(v)
 }
 
 // Set stores a value for the given attribute in the [Line] attached to ctx.
@@ -166,7 +181,7 @@ func Set[T any](ctx context.Context, attr Attr[T], value T) {
 
 	key := attr.key
 	if existing, exists := l.values[key]; exists && attr.merge != nil {
-		if oldVal, ok := existing.(T); ok {
+		if oldVal, ok := existing.raw.(T); ok {
 			value = attr.merge(oldVal, value)
 		}
 	}
@@ -176,7 +191,13 @@ func Set[T any](ctx context.Context, attr Attr[T], value T) {
 		l.order = append(l.order, key)
 	}
 
-	l.values[key] = value
+	// Create converter function if attr has custom toValue
+	var convert func(any) slog.Value
+	if attr.toValue != nil {
+		convert = func(v any) slog.Value { return attr.toValue(v.(T)) }
+	}
+
+	l.values[key] = storedValue{raw: value, convert: convert}
 }
 
 // Attrs returns all set attributes as [slog.Attr] values.
@@ -198,8 +219,14 @@ func Attrs(ctx context.Context) []slog.Attr {
 
 	result := make([]slog.Attr, 0, len(l.order))
 	for _, key := range l.order {
-		if value, exists := l.values[key]; exists {
-			result = append(result, slog.Attr{Key: key, Value: toSlogValue(value)})
+		if sv, exists := l.values[key]; exists {
+			var slogVal slog.Value
+			if sv.convert != nil {
+				slogVal = sv.convert(sv.raw)
+			} else {
+				slogVal = slog.AnyValue(sv.raw)
+			}
+			result = append(result, slog.Attr{Key: key, Value: slogVal})
 		}
 	}
 	return result
